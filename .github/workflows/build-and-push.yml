@@ -1,0 +1,320 @@
+name: Build and Push
+
+# 打 v* 标签时：构建 linux/amd64 镜像 → 推送 GHCR → 通过 SSH 滚动更新自有服务器上的容器。
+#
+# 与本仓既有的 ci.yml 分工（互不影响，本工作流不改 ci.yml）：
+#   - ci.yml        ：push main / PR 时做 gofmt + vet + build + go test -race + govulncheck。
+#   - 本工作流      ：**发布**流程。tag 时构建 amd64 单架构、推送与 tag 同名的镜像，并把
+#                     服务器上的 deepaicode2api 容器滚动到该版本（含容器状态校验与健康门）。
+on:
+  push:
+    tags:
+      # 形如 v2026.11.8.1638（按 tag 发布，不做 latest 漂移）
+      - "v*"
+  # 手动补发/补部署用：只有在**默认分支**上存在本文件时，Actions 列表里才出现该按钮。
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要构建并部署的镜像 tag（留空则用 sha-<短 sha>；手动补发时填已有 tag，如 v2026.11.8.1638）"
+        required: false
+        default: ""
+
+# 同一 ref 串行，避免两个部署同时改服务器上的容器。
+concurrency:
+  group: build-and-push-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/baicie/deepaicode2api
+
+jobs:
+  docker:
+    name: build-and-push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tag: ${{ steps.vars.outputs.tag }}
+      image: ${{ steps.vars.outputs.image }}
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: vars
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          # 优先用手动输入（补发/补部署时指到已有 tag）；其次 tag 触发的 ref_name；
+          # 最后回退到 sha-<短 sha>（手动跑分支时用）。
+          if [[ -n "${INPUT_TAG:-}" ]]; then
+            tag="${INPUT_TAG}"
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            tag="${GITHUB_REF_NAME}"
+          else
+            tag="sha-${GITHUB_SHA::7}"
+          fi
+          {
+            echo "tag=${tag}"
+            echo "image=${IMAGE}"
+          } >> "$GITHUB_OUTPUT"
+          echo "building ${IMAGE}:${tag}"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          # 必须注入版本号：Dockerfile 是 `ARG APP_VERSION=dev` 兜底，不传 build-args 时
+          # 运行中的 `main.version` 就是 "dev"（控制台版本号、/healthz 之外的版本展示都会错）。
+          build-args: |
+            APP_VERSION=${{ steps.vars.outputs.tag }}
+          # 与需求一致：只出 amd64。要 arm64 时改成 "linux/amd64,linux/arm64"，
+          # 并加一步 docker/setup-qemu-action@v3。
+          platforms: linux/amd64
+          tags: ${{ env.IMAGE }}:${{ steps.vars.outputs.tag }}
+          labels: |
+            org.opencontainers.image.title=deepaicode2api
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.vars.outputs.tag }}
+          cache-from: type=gha,scope=build-and-push
+          cache-to: type=gha,mode=max,scope=build-and-push
+          # 关闭 provenance：避免 ghcr 页面出现 unknown/unknown 架构条目。
+          provenance: false
+
+      - name: Verify pushed tag
+        run: |
+          # 双保险：确认刚推的 tag 真在 registry 上，防止"推送失败但 CI 绿"。
+          docker buildx imagetools inspect "${IMAGE}:${{ steps.vars.outputs.tag }}"
+
+  deploy:
+    name: deploy
+    needs: docker
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      DEPLOY_TAG: ${{ needs.docker.outputs.tag }}
+      IMAGE_REF: ${{ needs.docker.outputs.image }}
+      # 镜像 digest：按 digest 拉取（内容寻址），可安全使用第三方加速源。
+      IMAGE_DIGEST: ${{ needs.docker.outputs.digest }}
+      # 国内云主机直连 ghcr.io 实测约 21KB/s，默认先走加速源。
+      GHCR_MIRRORS: ${{ vars.GHCR_MIRRORS || 'ghcr.nju.edu.cn' }}
+      # 目标机默认值来自 docker_targets_82.156.234.84.csv（host/port/user）。
+      DEPLOY_HOST: ${{ vars.DEPLOY_HOST || '82.156.234.84' }}
+      DEPLOY_USER: ${{ vars.DEPLOY_USER || 'ubuntu' }}
+      DEPLOY_PORT: ${{ vars.DEPLOY_PORT || '22' }}
+      DEPLOY_DIR: '~/deepaicode2api'
+      CONTAINER: deepaicode2api
+      # /healthz 恒返回 200 JSON（不依赖上游账号池状态），适合做发布门。
+      HEALTH_URL: http://127.0.0.1:10087/healthz
+      SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      SSH_PASSWORD: ${{ secrets.DEPLOY_SSH_PASSWORD }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check deploy credentials
+        id: cred
+        run: |
+          set -euo pipefail
+          if [[ -n "${SSH_KEY:-}" ]]; then
+            method=key
+          elif [[ -n "${SSH_PASSWORD:-}" ]]; then
+            method=password
+          else
+            echo "::error::缺少部署凭据：请在仓库 Secrets 配置 DEPLOY_SSH_KEY（推荐）或 DEPLOY_SSH_PASSWORD"
+            exit 1
+          fi
+          echo "method=${method}" >> "$GITHUB_OUTPUT"
+          echo "deploy target: ${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PORT} dir=${DEPLOY_DIR} container=${CONTAINER}"
+
+      - name: Install SSH client
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq openssh-client sshpass
+
+      - name: Upload deploy compose
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          if [[ "${{ steps.cred.outputs.method }}" == "key" ]]; then
+            printf '%s\n' "${SSH_KEY}" > ~/.ssh/deploy_key
+            chmod 600 ~/.ssh/deploy_key
+            SSH=(ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes)
+          else
+            printf '%s' "${SSH_PASSWORD}" > ~/.ssh/pass
+            chmod 600 ~/.ssh/pass
+            SSH=(sshpass -f ~/.ssh/pass ssh)
+          fi
+          SSH+=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 -p "${DEPLOY_PORT}")
+
+          # 服务器不需要 git 仓库：目录按需创建，compose 文件用 base64 单次传过去
+          # （避开 rsync 与 sshpass 的交互问题，也不依赖 scp 的路径展开行为）。
+          COMPOSE_B64="$(base64 < deploy/docker-compose.deploy.yml | tr -d '\n')"
+          "${SSH[@]}" "${DEPLOY_USER}@${DEPLOY_HOST}" 'bash -s' -- "${DEPLOY_DIR}" "${COMPOSE_B64}" <<'REMOTE'
+          set -euo pipefail
+          RAW_DIR="$1"; B64="$2"
+          # 远端展开 ~ 与 $HOME（这两个写法在传参时不会二次展开，必须在远端处理）。
+          DIR="${RAW_DIR/#\$HOME/$HOME}"; DIR="${DIR/#\~/$HOME}"
+          COMPOSE_PATH="${DIR}/docker-compose.deploy.yml"
+          mkdir -p "$DIR"
+          printf '%s' "$B64" | base64 -d > "$COMPOSE_PATH"
+          chmod 644 "$COMPOSE_PATH"
+          echo "compose 已就绪: $COMPOSE_PATH"
+          # 顺带报告 .env / data 现状，便于在日志里直接定位首次部署的前置条件。
+          for f in .env data; do
+            if [[ -e "${DIR}/${f}" ]]; then echo "存在: ${DIR}/${f}"; else echo "缺失: ${DIR}/${f}"; fi
+          done
+          REMOTE
+
+      - name: Rolling update container
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          if [[ "${{ steps.cred.outputs.method }}" == "key" ]]; then
+            printf '%s\n' "${SSH_KEY}" > ~/.ssh/deploy_key
+            chmod 600 ~/.ssh/deploy_key
+            SSH=(ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes)
+          else
+            printf '%s' "${SSH_PASSWORD}" > ~/.ssh/pass
+            chmod 600 ~/.ssh/pass
+            SSH=(sshpass -f ~/.ssh/pass ssh)
+          fi
+          SSH+=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 -p "${DEPLOY_PORT}")
+
+          # 远端脚本从 stdin 读、参数用位置参数传（不拼进命令串，避免注入，
+          # 也避免 ${10}/${11} 这类越界展开在 set -u 下直接报 unbound variable）。
+          "${SSH[@]}" "${DEPLOY_USER}@${DEPLOY_HOST}" 'bash -s' -- \
+            "${IMAGE_REF}" "${DEPLOY_TAG}" "${IMAGE_DIGEST}" "${CONTAINER}" "${DEPLOY_DIR}" "${HEALTH_URL}" "${GHCR_MIRRORS}" <<'REMOTE'
+          set -euo pipefail
+          IMAGE="$1"; TAG="$2"; DIGEST="$3"; CONTAINER="$4"; RAW_DIR="$5"; HEALTH="$6"; MIRRORS="$7"
+          DIR="${RAW_DIR/#\$HOME/$HOME}"; DIR="${DIR/#\~/$HOME}"
+          CANONICAL="${IMAGE}:${TAG}"
+          REPO_PATH="${IMAGE#ghcr.io/}"
+
+          # docker 访问权限：云主机常见「用户在 sudo 组、但不在 docker 组」，
+          # 直连 socket 会 permission denied。这里自动回退到 sudo，避免部署直接失败。
+          if docker info >/dev/null 2>&1; then
+            DOCKER=(docker); echo "==> docker: 直连（当前用户已在 docker 组）"
+          elif sudo -n true >/dev/null 2>&1; then
+            DOCKER=(sudo -n docker); echo "==> docker: 经 sudo（当前用户不在 docker 组）"
+          else
+            echo "::error::当前用户无法访问 docker，且无免密 sudo。请在服务器执行：sudo usermod -aG docker <user> 后重新登录"
+            exit 1
+          fi
+
+          # compose 依赖 IMAGE_TAG 等变量；走 sudo 时 sudo 会清空环境，
+          # 所以用 `env` 显式把它们传给命令（.env 由 compose 自行从 cwd 读取）。
+          if [[ "${DOCKER[0]}" == "sudo" ]]; then
+            RUN=(sudo -n env "IMAGE_REPO=${IMAGE}" "IMAGE_TAG=${TAG}" "CONTAINER_NAME=${CONTAINER}" "COMPOSE_PROJECT_NAME=${CONTAINER}" docker)
+          else
+            RUN=(env "IMAGE_REPO=${IMAGE}" "IMAGE_TAG=${TAG}" "CONTAINER_NAME=${CONTAINER}" "COMPOSE_PROJECT_NAME=${CONTAINER}" docker)
+          fi
+
+          # **按 digest 拉取**：内容寻址，加速源无法替换镜像内容（哈希必须一致），
+          # 这也让「用第三方加速」不再是一个纯信任问题。加速源优先，直连 ghcr.io 兜底。
+          candidates=()
+          _add_mirrors() {
+            local suffix="$1"
+            [[ -z "${MIRRORS}" ]] && return 0
+            local IFS=','
+            for m in ${MIRRORS}; do
+              m="$(printf '%s' "$m" | tr -d '[:space:]')"
+              [[ -n "$m" ]] && candidates+=("${m}/${REPO_PATH}${suffix}")
+            done
+          }
+          if [[ -n "${DIGEST}" ]]; then
+            _add_mirrors "@${DIGEST}"
+            candidates+=("${IMAGE}@${DIGEST}")
+          else
+            _add_mirrors ":${TAG}"
+            candidates+=("${CANONICAL}")
+          fi
+
+          PULLED=""
+          for ref in "${candidates[@]}"; do
+            echo "==> docker pull ${ref}"
+            if timeout 240 "${RUN[@]}" pull "${ref}"; then PULLED="${ref}"; break; fi
+            echo "    （该源失败/超时，尝试下一个）"
+          done
+          if [[ -z "${PULLED}" ]]; then
+            echo "::error::所有镜像源都拉取失败：${candidates[*]}"
+            exit 1
+          fi
+          "${RUN[@]}" tag "${PULLED}" "${CANONICAL}"
+          echo "==> 镜像就绪：${CANONICAL}（来源 ${PULLED}）"
+
+          cd "${DIR}"
+          # .env 必须先存在：compose 用它插值 DEEPAI2API_ADMIN_PASSWORD / DEEPAI_MACHINE_ID /
+          # PROXY_POOL。缺失时管理接口回环可访问但无密码、且机器指纹为空会导致上游拒绝
+          # 所有请求（426 lane_version_unsupported）。这里显式失败并给出可操作提示，
+          # 不静默创建、不覆盖该文件。
+          if [[ ! -f .env ]]; then
+            echo "::error::${DIR}/.env 不存在。首次部署请先在该目录准备 .env："
+            echo "  cp <repo>/.env.example ${DIR}/.env   # 至少填 DEEPAI2API_ADMIN_PASSWORD 与 DEEPAI_MACHINE_ID"
+            echo "（.env 含密钥，本工作流不会创建、不会覆盖、不会打印其内容）"
+            exit 1
+          fi
+          # data 目录缺失时 Docker 会以 root 建目录，容器随后因权限写不进状态文件，
+          # 这里提前建好并归到容器 uid，给出可操作提示而不是让容器静默崩溃。
+          if [[ ! -d data ]]; then
+            echo "==> ${DIR}/data 不存在，创建并归到 10001:10001"
+            mkdir -p data
+            if [[ "${DOCKER[0]}" == "sudo" ]]; then sudo -n chown -R 10001:10001 data; else chown -R 10001:10001 data 2>/dev/null || echo "    （无需 chown：当前用户可写）"; fi
+          fi
+
+          if ! "${RUN[@]}" compose version >/dev/null 2>&1; then
+            echo "::error::服务器缺少 docker compose 插件（需要 docker compose 或 docker-compose）"
+            exit 1
+          fi
+
+          echo "==> 滚动更新（${DIR}）"
+          # --pull never：镜像已在上一步按 digest 拉好并改成规范名，这里不要再回源。
+          "${RUN[@]}" compose -f docker-compose.deploy.yml up -d --pull never --remove-orphans
+
+          echo "==> 容器状态"
+          "${RUN[@]}" ps --filter "name=${CONTAINER}" --format 'table {{.Names}}	{{.Image}}	{{.Status}}	{{.Ports}}'
+
+          # 容器必须 running，否则本次发布判失败（不允许 CI 绿着但服务没起来）。
+          state="$("${RUN[@]}" inspect -f '{{.State.Status}}' "${CONTAINER}" 2>/dev/null || echo missing)"
+          if [[ "${state}" != "running" ]]; then
+            echo "::error::容器 ${CONTAINER} 状态=${state}，发布失败"
+            "${RUN[@]}" logs --tail 80 "${CONTAINER}" 2>&1 || true
+            exit 1
+          fi
+
+          # 健康门：/healthz 恒 200。服务未起来时 curl 会拿到 000/5xx，CI 必须红。
+          if [[ -n "${HEALTH}" ]]; then
+            code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "${HEALTH}" || echo 000)"
+            echo "==> 健康检查 ${HEALTH} -> HTTP ${code}"
+            if [[ "${code}" != "200" ]]; then
+              echo "::error::健康检查未通过（HTTP ${code}）"
+              "${RUN[@]}" logs --tail 60 "${CONTAINER}" 2>&1 || true
+              exit 1
+            fi
+          fi
+
+          # 只清悬空镜像（服务器上还有别人的在用镜像，禁止 system prune -a）。
+          "${RUN[@]}" image prune -f >/dev/null 2>&1 || true
+          echo "部署完成：${CANONICAL}"
+          REMOTE
+
+      - name: Cleanup credentials
+        if: always()
+        run: rm -f ~/.ssh/deploy_key ~/.ssh/pass

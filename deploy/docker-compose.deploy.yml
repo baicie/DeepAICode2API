@@ -1,0 +1,41 @@
+# 服务器侧部署用 compose（**镜像型**：不在服务器上构建，只拉 GHCR 镜像）。
+#
+# 由 .github/workflows/build-and-push.yml 在打 v* 标签时自动上传到：
+#   ${DEPLOY_DIR}/docker-compose.deploy.yml     默认 ~/deepaicode2api/
+# 然后以 IMAGE_TAG=<v...> 执行 `docker compose -f docker-compose.deploy.yml up -d --pull never`。
+#
+# 与仓库根目录的 docker-compose.yml 的区别：那份是 `build: .`（本地构建、桥接网络、
+# 0.0.0.0:10087 暴露公网）；这份是发布产物，供服务器直接拉取指定版本，且**只监听回环**。
+#
+# 变量来源分两类：
+#   - CI 注入（远端的 `env` 前缀）：IMAGE_REPO / IMAGE_TAG / CONTAINER_NAME
+#   - 服务器上的 ${DEPLOY_DIR}/.env（compose 自动读取同目录 .env 做插值）：
+#     DEEPAI2API_ADMIN_PASSWORD / DEEPAI_MACHINE_ID / PROXY_POOL
+# 该 .env 由运维侧准备，缺失时工作流会显式报错退出，**不会**由 CI 自动生成。
+services:
+  deepaicode2api:
+    image: ${IMAGE_REPO:-ghcr.io/baicie/deepaicode2api}:${IMAGE_TAG:-latest}
+    container_name: ${CONTAINER_NAME:-deepaicode2api}
+    restart: unless-stopped
+    # host 网络：把容器直接放进宿主网络栈，端口即宿主端口。
+    # 因此本文件**不能写 ports:**（compose 会直接报错），监听范围完全由
+    # DEEPAI2API_HOST 决定——必须是 127.0.0.1，公网入口统一走前置 Caddy
+    # （https://dai.moonbyte.top:8443 → 127.0.0.1:10087）。
+    network_mode: host
+    # 与镜像自带的 USER 10001:10001 同口径；宿主 ./data 属主为 10001:10001 时
+    # 才能写状态文件。可用 .env 的 PUID/PGID 覆盖。
+    user: "${PUID:-10001}:${PGID:-10001}"
+    environment:
+      TZ: Asia/Shanghai
+      # 关键：host 网络下容器没有独立端口映射，必须显式绑回环，否则会监听 0.0.0.0。
+      DEEPAI2API_HOST: 127.0.0.1
+      DEEPAI2API_PORT: "10087"
+      DEEPAI2API_DATA_PATH: /data/deepaicode2api-data.json
+      # 以下三项来自服务器上的 .env（compose 自动插值）；未配置时留空，
+      # 由程序自身按空值处理（无管理密码时管理接口只允许回环访问）。
+      DEEPAI2API_ADMIN_PASSWORD: ${DEEPAI2API_ADMIN_PASSWORD:-}
+      DEEPAI_MACHINE_ID: ${DEEPAI_MACHINE_ID:-}
+      PROXY_POOL: ${PROXY_POOL:-}
+    volumes:
+      - ./data:/data
+    # 不覆盖镜像自带的 HEALTHCHECK：它探 /healthz（恒 200），只反映进程存活。
