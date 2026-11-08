@@ -34,8 +34,22 @@ services:
       # 以下三项来自服务器上的 .env（compose 自动插值）；未配置时留空，
       # 由程序自身按空值处理（无管理密码时管理接口只允许回环访问）。
       DEEPAI2API_ADMIN_PASSWORD: ${DEEPAI2API_ADMIN_PASSWORD:-}
+      # 状态文件加密主密钥（32 字节 hex/base64，生成：openssl rand -hex 32）。
+      # 留空 = 明文落盘 + 启动警告（程序自身行为，不阻塞部署）；由后续任务写入服务器 .env。
+      # 密钥值只存在于 .env，绝不写进本文件或仓库。
+      DEEPAI2API_MASTER_KEY: ${DEEPAI2API_MASTER_KEY:-}
       DEEPAI_MACHINE_ID: ${DEEPAI_MACHINE_ID:-}
+      # 注意：PROXY_POOL 只服务**注册链路**（internal/register/config.go），
+      # 对推理与模型目录拉取无效——那部分走 internal/deepai/client.go 的
+      # http.ProxyFromEnvironment，只认标准代理环境变量（见下面三条）。
       PROXY_POOL: ${PROXY_POOL:-}
+      # 出口代理：容器需要访问 api.deepai.org（拉模型目录 / 推理），本机直连不通，
+      # 走宿主机上的 mihomo（host 网络下 127.0.0.1 即宿主回环）。
+      # 地址不写死：.env 里设 UPSTREAM_PROXY 即可整体切换，默认 127.0.0.1:7890。
+      HTTP_PROXY: ${UPSTREAM_PROXY:-http://127.0.0.1:7890}
+      HTTPS_PROXY: ${UPSTREAM_PROXY:-http://127.0.0.1:7890}
+      # 本机回环与 docker 网桥不走代理，否则网关自身的健康检查/控制台调用会被绕进代理。
+      NO_PROXY: "127.0.0.1,localhost,172.17.0.1,::1"
     volumes:
       - ./data:/data
     # 不覆盖镜像自带的 HEALTHCHECK：它探 /healthz（恒 200），只反映进程存活。
